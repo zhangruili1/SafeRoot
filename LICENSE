@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 zhangruili1
+Copyright (c) 2026 SafeRoot Contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,3 +19,30 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+===============================================================================
+免责声明 (Disclaimer)
+===============================================================================
+
+1. 本程序（SafeRoot）是一款通用的 Windows hosts 文件管理工具，提供用户
+   自主管理域名解析规则的功能。本程序的设计初衷为个人网络安全管理辅助工具。
+
+2. 本程序**不包含任何预设的屏蔽地址、黑名单或针对特定网站/软件的规则**。
+   程序中所有屏蔽规则均由用户自行输入和添加，开发者不对用户添加的具体规则
+   内容承担任何责任。
+
+3. 本程序**未恶意针对任何网站、软件、企业或个人**。程序的用途取决于用户
+   自身的选择和行为，开发者不对用户如何使用本程序承担任何责任。
+
+4. 用户应确保其使用本程序的行为符合所在地区的法律法规。因用户不当使用
+   本程序（包括但不限于添加违法屏蔽规则）而产生的一切法律后果，均由用户
+   自行承担，与开发者无关。
+
+5. 修改系统 hosts 文件可能影响系统的网络功能。用户在使用本程序前应充分
+   了解 hosts 文件的作用，并做好备份。因使用本程序导致系统网络功能异常的，
+   开发者不承担任何责任。
+
+6. 本程序以开源形式发布，仅供学习和合法用途使用。严禁将本程序用于任何
+   违法活动。
+
+===============================================================================

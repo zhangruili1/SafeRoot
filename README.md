@@ -1,2 +1,95 @@
-# SafeRoot
-SafeRoot is an open-source desktop tool for managing Windows hosts files. It features an intuitive graphical interface that allows users to easily manage domain resolution rules, enabling functionalities such as website blocking and redirection."
+# SafeRoot - Windows Hosts 文件管理工具
+
+## 项目简介
+
+SafeRoot 是一款开源的 Windows hosts 文件管理桌面工具。用户可以通过直观的图形界面管理域名解析规则，实现网站屏蔽、重定向等功能。
+
+**重要声明：本程序为通用工具，不包含任何预设屏蔽地址或针对特定网站/软件的规则。所有屏蔽规则均由用户自行添加。**
+
+## 功能特性
+
+- 管理 hosts 文件，屏蔽或重定向指定域名
+- 单条/批量添加屏蔽规则，支持从 URL 自动提取域名
+- 规则启用、禁用、删除，支持批量操作
+- hosts 文件备份与一键恢复
+- 批量导入/导出规则（TXT / CSV）
+- 写入 hosts 后自动刷新 DNS 缓存，规则立即生效
+- 自动检测并请求管理员权限
+- 可配置开机自启动
+- 完整操作日志记录
+
+## 系统要求
+
+- Windows 7 / 8 / 10 / 11
+- Python 3.9+
+- 管理员权限（运行时需要）
+
+## 安装与运行
+
+```bash
+# 1. 克隆项目
+git clone <repo-url>
+cd 屏蔽器
+
+# 2. 安装依赖
+pip install -r requirements.txt
+
+# 3. 运行（需管理员权限）
+python main.py
+```
+
+## 使用说明
+
+1. **添加屏蔽规则**：在"屏蔽列表"页点击"添加网址"，输入域名或完整 URL，确认即可。
+2. **管理规则**：通过复选框选择规则，可批量启用、禁用或删除。
+3. **备份恢复**：在"备份管理"页可创建、恢复或删除 hosts 文件备份。
+4. **系统设置**：在"系统设置"页可配置自启动、更新检查等选项。
+
+## 项目结构
+
+```
+SafeRoot/
+├── main.py                 # 应用程序入口（管理员权限检测）
+├── constants.py            # 常量定义
+├── requirements.txt        # Python 依赖
+├── LICENSE                 # MIT 开源协议 + 法律免责声明
+├── CHANGELOG.md            # 开发日志
+├── README.md               # 项目说明
+├── .gitignore              # Git 忽略规则
+└── src/
+    ├── __init__.py
+    ├── core/
+    │   ├── __init__.py
+    │   ├── hosts_manager.py   # hosts 文件读写管理
+    │   ├── rule_manager.py    # 规则数据库管理（SQLite）
+    │   └── logger.py          # 日志模块
+    └── ui/
+        ├── __init__.py
+        ├── main_window.py     # 主窗口
+        ├── add_rule_dialog.py # 添加规则对话框
+        ├── backup_tab.py      # 备份管理标签页
+        └── settings_tab.py    # 系统设置标签页
+```
+
+## 技术栈
+
+- **Python 3.9+**
+- **PyQt5** — 图形用户界面
+- **SQLite3** — 规则持久化存储
+- **ctypes** — Windows API 调用（管理员权限检测）
+
+## 免责声明
+
+1. **本程序为通用 hosts 文件管理工具**，不包含任何预设的屏蔽地址、黑名单或针对特定网站/软件的规则。程序中所有屏蔽规则均由用户自行输入和添加。
+
+2. **本程序未恶意针对任何网站、软件、企业或个人。** 程序的用途完全取决于用户自身的选择和行为。
+
+3. 用户应确保其使用本程序的行为符合所在地区的法律法规。因用户不当使用本程序而产生的一切法律后果，均由用户自行承担。
+
+4. 修改系统 hosts 文件可能影响网络功能，用户应在充分了解后果并做好备份后使用。
+
+5. 本程序以 MIT 协议开源发布，仅供学习和合法用途使用。详见 [LICENSE](LICENSE)。
+
+## 许可证
+
+[MIT License](LICENSE)
