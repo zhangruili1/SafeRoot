@@ -1,3 +1,7 @@
+<img width="902" height="632" alt="image" src="https://github.com/user-attachments/assets/ff6e4ef3-4cc9-42c2-8d5c-4e16ed1148e6" />
+<img width="902" height="632" alt="image" src="https://github.com/user-attachments/assets/9eac1231-cb59-44fe-8a1f-099bdd831ec1" />
+
+
 # SafeRoot - Windows Hosts 文件管理工具
 
 ## 项目简介
