@@ -27,6 +27,8 @@ try:
     from src.core.firewall_manager import FirewallManager
     from src.core.doh_controller import DohController
     from src.core.logger import get_logger
+    from src.ui.collect_domain_dialog import CollectDomainDialog
+    from src.core.library_updater import LibraryUpdater
 except ImportError:
     try:
         # 如果失败，尝试将项目根目录添加到sys.path
@@ -37,6 +39,8 @@ except ImportError:
         from src.core.hosts_manager import HostsManager
         from src.core.rule_manager import RuleManager, validate_domain
         from src.core.logger import get_logger
+        from src.ui.collect_domain_dialog import CollectDomainDialog
+        from src.core.library_updater import LibraryUpdater
     except ImportError:
         try:
             # 最后尝试直接从core导入（如果src在路径中）
@@ -145,6 +149,27 @@ except ImportError:
 
 
 
+
+
+
+
+
+class LibraryUpdateWorker(QThread):
+    """后台预设库更新线程"""
+
+    finished = pyqtSignal(dict)  # update result dict
+
+    def __init__(self, force=False):
+        super().__init__()
+        self.force = force
+
+    def run(self):
+        try:
+            updater = LibraryUpdater()
+            result = updater.update(force=self.force)
+        except Exception as e:
+            result = {'success': False, 'message': f'更新异常: {e}', 'total': 0, 'new': 0, 'new_domains': []}
+        self.finished.emit(result)
 
 
 class AddRuleWorker(QThread):
@@ -399,6 +424,9 @@ class MainWindow(QMainWindow):
         
         # 启动时同步防火墙规则（确保与数据库一致）
         QTimer.singleShot(1500, self._startup_sync_firewall)
+        
+        # 启动时后台自动更新预设库（静默，不阻塞 UI）
+        QTimer.singleShot(2000, self._auto_update_library)
     
     def init_ui(self):
         """初始化用户界面"""
@@ -550,6 +578,13 @@ class MainWindow(QMainWindow):
         self.btn_add = QPushButton("添加网址")
         self.btn_add.clicked.connect(self.on_add_rule)
         
+        self.btn_collect = QPushButton("智能采集")
+        self.btn_collect.clicked.connect(self.on_collect_domains)
+        
+        self.btn_library = QPushButton("预设库导入")
+        self.btn_library.setToolTip("从 GitHub 预设库一键导入屏蔽域名")
+        self.btn_library.clicked.connect(self.on_library_import)
+        
         self.btn_import = QPushButton("批量导入")
         self.btn_import.clicked.connect(self.on_batch_import)
         
@@ -560,6 +595,8 @@ class MainWindow(QMainWindow):
         self.btn_restore_all.clicked.connect(self.on_clear_all)
         
         toolbar_layout.addWidget(self.btn_add)
+        toolbar_layout.addWidget(self.btn_collect)
+        toolbar_layout.addWidget(self.btn_library)
         toolbar_layout.addWidget(self.btn_import)
         toolbar_layout.addWidget(self.btn_export)
         toolbar_layout.addWidget(self.btn_restore_all)
@@ -960,7 +997,66 @@ class MainWindow(QMainWindow):
             
         except Exception as e:
             self.lbl_stats.setText("统计信息加载失败")
-    
+
+    def on_collect_domains(self):
+        """智能采集域名并添加到屏蔽列表"""
+        dialog = CollectDomainDialog(self)
+        if dialog.exec_() == QDialog.Accepted:
+            selected = dialog.get_selected_domains()
+            if not selected:
+                QMessageBox.information(self, "提示", "没有选择任何域名")
+                return
+
+            # 检查重复
+            existing_rules = self.rule_manager.get_all_rules()
+            existing_domains = {rule['domain'] for rule in existing_rules}
+            domains_to_add = [d for d in selected if d not in existing_domains]
+            duplicates = len(selected) - len(domains_to_add)
+
+            if not domains_to_add:
+                QMessageBox.information(self, "提示",
+                    f"所有 {len(selected)} 个域名都已存在于屏蔽列表中")
+                return
+
+            # 构建 AddRuleWorker 需要的格式，复用批量添加逻辑
+            rules_data = [{'domain': d, 'redirect_to': '0.0.0.0', 'remark': '智能采集'} for d in domains_to_add]
+
+            if self.operation_in_progress:
+                QMessageBox.warning(self, "操作进行中", "当前有操作正在进行，请稍候")
+                return
+
+            self._pending_rules_data = rules_data
+            worker = AddRuleWorker(
+                self.rule_manager, self.hosts_manager, self.firewall_manager,
+                rules_data, is_batch=True
+            )
+            worker.finished.connect(lambda s, f, b: self._on_collect_add_finished(s, f, duplicates))
+            worker.error.connect(self._on_add_rule_error)
+            self.current_worker = worker
+            self.operation_in_progress = True
+            self._set_batch_buttons_enabled(False)
+            self.status_bar.showMessage(f"正在添加 {len(domains_to_add)} 个采集域名...")
+            worker.start()
+
+    def _on_collect_add_finished(self, success_count, failed_domains, duplicate_count):
+        """智能采集添加完成"""
+        self._set_batch_buttons_enabled(True)
+        self.operation_in_progress = False
+
+        parts = []
+        if success_count > 0:
+            parts.append(f"{success_count} 个添加成功")
+        if duplicate_count > 0:
+            parts.append(f"{duplicate_count} 个已存在跳过")
+        if failed_domains:
+            parts.append(f"{len(failed_domains)} 个失败")
+
+        msg = "，".join(parts)
+        self.status_bar.showMessage(f"智能采集完成: {msg}", 5000)
+        QMessageBox.information(self, "采集完成",
+            f"智能采集结果:\n\n{msg}\n\n请关闭并重新打开浏览器使屏蔽生效。")
+        self.load_rules()
+
     def on_add_rule(self):
         """添加规则"""
         self.logger.info("开始添加规则流程")
@@ -1757,6 +1853,130 @@ class MainWindow(QMainWindow):
                 self.logger.info(f"启动时同步了 {len(enabled_domains)} 条防火墙规则")
         except Exception as e:
             self.logger.warning(f"启动时同步防火墙规则失败: {e}")
+
+    def _auto_update_library(self):
+        """启动时后台静默更新预设库（不弹窗，仅在日志中记录结果）"""
+        self._library_worker = LibraryUpdateWorker(force=False)
+        self._library_worker.finished.connect(self._on_auto_library_update_done)
+        self._library_worker.start()
+
+    def _on_auto_library_update_done(self, result):
+        """启动自动更新预设库完成回调"""
+        if result.get('success'):
+            new_count = result.get('new', 0)
+            if new_count > 0:
+                self.logger.info(f"预设库已更新: 新增 {new_count} 个域名（共 {result.get('total', 0)} 个）")
+                self.status_bar.showMessage(
+                    f"预设库已更新: 新增 {new_count} 个域名，点击「预设库导入」一键添加", 8000
+                )
+            else:
+                self.logger.info(f"预设库已是最新: 共 {result.get('total', 0)} 个域名")
+        else:
+            self.logger.warning(f"预设库更新失败: {result.get('message', '未知错误')}")
+
+    def on_library_import(self):
+        """从预设库一键导入域名到屏蔽列表"""
+        # 先读取本地预设库（确保有数据）
+        try:
+            updater = LibraryUpdater()
+            domains = updater.get_local_domains()
+        except Exception as e:
+            QMessageBox.warning(self, "预设库错误", f"读取预设库失败: {e}")
+            return
+
+        if not domains:
+            reply = QMessageBox.question(
+                self, "预设库为空",
+                "本地预设库为空，是否从 GitHub 下载最新预设库？\n\n需要网络连接。",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.Yes:
+                self.status_bar.showMessage("正在从 GitHub 下载预设库...")
+                self._library_worker = LibraryUpdateWorker(force=True)
+                self._library_worker.finished.connect(self._on_library_import_after_update)
+                self._library_worker.start()
+            return
+
+        self._do_library_import(domains)
+
+    def _on_library_import_after_update(self, result):
+        """手动触发更新后再导入"""
+        if not result.get('success'):
+            QMessageBox.warning(self, "下载失败", result.get('message', '下载预设库失败'))
+            return
+        try:
+            updater = LibraryUpdater()
+            domains = updater.get_local_domains()
+        except Exception as e:
+            QMessageBox.warning(self, "错误", f"读取预设库失败: {e}")
+            return
+        if not domains:
+            QMessageBox.information(self, "提示", "预设库下载成功但没有有效的域名数据")
+            return
+        self._do_library_import(domains)
+
+    def _do_library_import(self, domains):
+        """执行预设库域名导入"""
+        # 去重：排除已存在的域名
+        existing_rules = self.rule_manager.get_all_rules()
+        existing_domains = {rule['domain'] for rule in existing_rules}
+        domains_to_add = [d for d in domains if d not in existing_domains]
+
+        if not domains_to_add:
+            QMessageBox.information(self, "提示",
+                f"预设库中 {len(domains)} 个域名已全部存在于屏蔽列表中")
+            return
+
+        # 确认导入
+        reply = QMessageBox.question(
+            self, "确认导入预设库",
+            f"预设库中共有 {len(domains)} 个域名，"
+            f"其中 {len(domains_to_add)} 个为新域名。\n\n"
+            f"是否一键导入所有新域名？",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        # 复用 AddRuleWorker 批量添加
+        rules_data = [{'domain': d, 'redirect_to': '0.0.0.0', 'remark': '预设库导入'} for d in domains_to_add]
+
+        if self.operation_in_progress:
+            QMessageBox.warning(self, "操作进行中", "当前有操作正在进行，请稍候")
+            return
+
+        self._pending_rules_data = rules_data
+        worker = AddRuleWorker(
+            self.rule_manager, self.hosts_manager, self.firewall_manager,
+            rules_data, is_batch=True
+        )
+        worker.finished.connect(lambda s, f, b: self._on_library_add_finished(s, f, len(domains)))
+        worker.error.connect(self._on_add_rule_error)
+        self.current_worker = worker
+        self.operation_in_progress = True
+        self._set_batch_buttons_enabled(False)
+        self.status_bar.showMessage(f"正在导入预设库: {len(domains_to_add)} 个新域名...")
+        worker.start()
+
+    def _on_library_add_finished(self, success_count, failed_domains, total_in_library):
+        """预设库导入完成回调"""
+        self._set_batch_buttons_enabled(True)
+        self.operation_in_progress = False
+        skipped = total_in_library - success_count - len(failed_domains)
+
+        parts = []
+        if success_count > 0:
+            parts.append(f"{success_count} 个导入成功")
+        if skipped > 0:
+            parts.append(f"{skipped} 个已存在跳过")
+        if failed_domains:
+            parts.append(f"{len(failed_domains)} 个失败")
+
+        msg = "，".join(parts)
+        self.status_bar.showMessage(f"预设库导入完成: {msg}", 5000)
+        QMessageBox.information(self, "导入完成",
+            f"预设库导入结果:\n\n{msg}\n\n请关闭并重新打开浏览器使屏蔽生效。")
+        self.load_rules()
 
     def _ensure_doh_disabled(self):
         """启动时确保浏览器 DoH 已禁用"""
