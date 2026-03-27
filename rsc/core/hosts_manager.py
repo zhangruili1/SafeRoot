@@ -26,10 +26,37 @@ except ImportError:
 class HostsManager:
     """Hosts 文件管理器"""
     
-    # 规则匹配正则表达式
-    RULE_PATTERN = re.compile(r'^\s*(?P<disabled>#)?\s*(?P<ip>\d{1,3}(?:\.\d{1,3}){3})\s+(?P<domain>\S+)(?:\s+#.*)?$')
+    # 规则匹配正则表达式（支持 IPv4 和 IPv6）
+    RULE_PATTERN = re.compile(r'^\s*(?P<disabled>#)?\s*(?P<ip>[\da-fA-F.:]+)\s+(?P<domain>\S+)(?:\s+#.*)?$')
     COMMENT_PATTERN = re.compile(r'^\s*#')
     EMPTY_PATTERN = re.compile(r'^\s*$')
+
+    @staticmethod
+    def _ipv4_to_ipv6_redirect(ipv4: str) -> str:
+        """根据 IPv4 地址返回对应的 IPv6 屏蔽地址"""
+        if ipv4 == '0.0.0.0':
+            return '::'
+        return '::1'
+
+    def _add_hosts_entries(self, lines: list, domain: str, redirect_to: str) -> list:
+        """向 hosts 行列表添加 IPv4 + IPv6 屏蔽条目（去重）"""
+        existing_domains = set()
+        for line in lines:
+            match = self.RULE_PATTERN.match(line)
+            if match and match.group('domain') == domain:
+                existing_domains.add((match.group('ip'), match.group('domain')))
+
+        added = False
+        if (redirect_to, domain) not in existing_domains:
+            lines.append(f"{redirect_to} {domain}")
+            added = True
+
+        ipv6 = self._ipv4_to_ipv6_redirect(redirect_to)
+        if (ipv6, domain) not in existing_domains:
+            lines.append(f"{ipv6} {domain}")
+            added = True
+
+        return lines, added
     
     def __init__(self):
         """初始化 HostsManager"""
@@ -252,7 +279,7 @@ class HostsManager:
         except Exception as e:
             raise Exception(f"清理备份失败: {e}")
     
-    def add_rule(self, domain: str, redirect_to: str = "127.0.0.1") -> bool:
+    def add_rule(self, domain: str, redirect_to: str = "0.0.0.0") -> bool:
         """
         添加屏蔽规则
         
@@ -292,9 +319,12 @@ class HostsManager:
                         # 规则已存在且已启用
                         return False
             
-            # 添加新规则
+            # 添加新规则（IPv4 + IPv6）
             new_rule = f"{redirect_to} {domain}"
+            ipv6_redirect = self._ipv4_to_ipv6_redirect(redirect_to)
+            ipv6_rule = f"{ipv6_redirect} {domain}"
             lines.append(new_rule)
+            lines.append(ipv6_rule)
             new_content = '\n'.join(lines)
             
             return self.write_hosts(new_content)
@@ -321,7 +351,7 @@ class HostsManager:
             for line in lines:
                 match = self.RULE_PATTERN.match(line)
                 if match and match.group('domain') == domain:
-                    # 跳过这个规则（移除）
+                    # 跳过这个规则（移除），同时移除 IPv4 和 IPv6 条目
                     removed = True
                     continue
                 new_lines.append(line)
@@ -436,14 +466,31 @@ class HostsManager:
             raise Exception(f"切换规则状态失败: {e}")
     
     def _flush_dns(self):
-        """刷新 Windows DNS 缓存，使 hosts 文件修改立即生效"""
+        """刷新 DNS 缓存并确保 hosts 文件优先"""
         try:
-            subprocess.run(
-                ['ipconfig', '/flushdns'],
-                capture_output=True,
-                timeout=10
-            )
+            # 多次刷新 DNS 缓存确保生效
+            for _ in range(2):
+                subprocess.run(
+                    ['ipconfig', '/flushdns'],
+                    capture_output=True,
+                    timeout=10
+                )
             self.logger.debug("DNS 缓存已刷新")
+
+            # 禁用 DNS 并行解析，确保 hosts 文件优先于 DNS 服务器
+            # 某些 Windows 配置下，DNS 服务器响应比 hosts 文件快，
+            # 导致 hosts 规则被绕过。设置此注册表项可强制 hosts 优先。
+            try:
+                import winreg
+                key_path = r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters"
+                with winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, key_path, 0,
+                                         winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY) as key:
+                    # DisableParallelAandAAAA = 1 → 禁用并行 DNS/AAAA 查询
+                    winreg.SetValueEx(key, "DisableParallelAandAAAA", 0, winreg.REG_DWORD, 1)
+                self.logger.info("已设置 hosts 文件 DNS 优先解析")
+            except Exception as e:
+                self.logger.warning(f"设置 DNS 优先级失败（可能权限不足）: {e}")
+
         except Exception as e:
             self.logger.warning(f"刷新 DNS 缓存失败: {e}")
 
