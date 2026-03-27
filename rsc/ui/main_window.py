@@ -24,6 +24,8 @@ try:
     # 首先尝试从src.core导入
     from src.core.hosts_manager import HostsManager
     from src.core.rule_manager import RuleManager, validate_domain
+    from src.core.firewall_manager import FirewallManager
+    from src.core.doh_controller import DohController
     from src.core.logger import get_logger
 except ImportError:
     try:
@@ -73,8 +75,23 @@ except ImportError:
                 def get_rule_count(self, enabled_only=False): return 0
                 def close(self): pass
             
+            class DummyFirewallManager:
+                def __init__(self): pass
+                def block_domain(self, domain): return {'success': True, 'ips': [], 'blocked_count': 0, 'errors': []}
+                def unblock_domain(self, domain): return 0
+                def sync_firewall_rules(self, domains): pass
+                def cleanup_all(self): return 0
+            
+            class DummyDohController:
+                def __init__(self): pass
+                def disable_all(self): return {}
+                def restore_all(self): return {}
+                def get_status(self): return {}
+            
             HostsManager = DummyHostsManager
             RuleManager = DummyRuleManager
+            FirewallManager = DummyFirewallManager
+            DohController = DummyDohController
             validate_domain = lambda x: bool(x and isinstance(x, str))
             
             # 创建虚拟日志函数
@@ -136,10 +153,11 @@ class AddRuleWorker(QThread):
     finished = pyqtSignal(int, list, bool)  # success_count, failed_domains, is_batch
     error = pyqtSignal(str)  # 错误消息
 
-    def __init__(self, rule_manager, hosts_manager, rules_data, is_batch=False):
+    def __init__(self, rule_manager, hosts_manager, firewall_manager, rules_data, is_batch=False):
         super().__init__()
         self.rule_manager = rule_manager
         self.hosts_manager = hosts_manager
+        self.firewall_manager = firewall_manager
         self.rules_data = rules_data
         self.is_batch = is_batch
 
@@ -150,7 +168,7 @@ class AddRuleWorker(QThread):
         try:
             for rule_data in self.rules_data:
                 domain = rule_data['domain']
-                redirect_to = rule_data['redirect_to'] or '127.0.0.1'
+                redirect_to = rule_data['redirect_to'] or '0.0.0.0'
                 remark = rule_data['remark']
 
                 if not validate_domain(domain):
@@ -162,6 +180,12 @@ class AddRuleWorker(QThread):
                 )
 
                 if success:
+                    # 关键：先通过防火墙阻断域名真实 IP（此时 hosts 还没写入，
+                    # DNS 解析能拿到真实 IP），再写 hosts 文件。
+                    # 否则 hosts 先写入 127.0.0.1 后，DNS 解析只返回 127.0.0.1，
+                    # 防火墙管理器无法获取真实 IP，浏览器 DoH 绕过 hosts 导致屏蔽无效。
+                    self.firewall_manager.block_domain(domain)
+
                     hosts_success = self.hosts_manager.add_rule(
                         domain, redirect_to
                     )
@@ -179,6 +203,52 @@ class AddRuleWorker(QThread):
             self.finished.emit(success_count, failed_domains, self.is_batch)
 
 
+class VerifyWorker(QThread):
+    """后台屏蔽验证线程（TCP 连接测试）"""
+
+    result = pyqtSignal(str, str, bool, str)  # domain, info, is_blocked, method
+
+    def __init__(self, domains):
+        super().__init__()
+        self.domains = domains
+
+    def run(self):
+        import socket
+        for domain in self.domains:
+            try:
+                # 1. DNS 解析测试
+                addr_info = socket.getaddrinfo(domain, None, socket.AF_INET)
+                if addr_info:
+                    resolved_ip = addr_info[0][4][0]
+                else:
+                    resolved_ip = "解析失败"
+
+                # 2. TCP 连接测试（端口 443）— 更准确反映浏览器实际行为
+                if resolved_ip not in ("解析失败", "127.0.0.1", "0.0.0.0"):
+                    try:
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock.settimeout(3)
+                        sock.connect((domain, 443))
+                        sock.close()
+                        # TCP 连接成功 = 未被屏蔽
+                        self.result.emit(domain, f"DNS: {resolved_ip}, TCP 443: 连通", False, "TCP")
+                        continue
+                    except (socket.timeout, ConnectionRefusedError, OSError):
+                        # TCP 连接被拒绝或超时 = 可能被防火墙阻断
+                        self.result.emit(domain, f"DNS: {resolved_ip}, TCP 443: 已阻断", True, "防火墙")
+                        continue
+                    except Exception:
+                        pass
+
+                # 3. 回退到 DNS 判断
+                is_blocked = resolved_ip in ('127.0.0.1', '0.0.0.0', '解析失败')
+                method = "hosts" if is_blocked else "DNS"
+                self.result.emit(domain, f"DNS: {resolved_ip}", is_blocked, method)
+
+            except Exception as e:
+                self.result.emit(domain, f"验证异常: {e}", False, "异常")
+
+
 class BatchOperationWorker(QThread):
     """后台批量操作工作线程"""
     
@@ -187,18 +257,20 @@ class BatchOperationWorker(QThread):
     finished = pyqtSignal(int, bool, str)  # 成功数量，是否完全成功，操作类型
     error = pyqtSignal(str)  # 错误消息
     
-    def __init__(self, rule_manager, hosts_manager, rule_ids, operation_type):
+    def __init__(self, rule_manager, hosts_manager, firewall_manager, rule_ids, operation_type):
         """初始化工作线程
         
         Args:
             rule_manager: 规则管理器
             hosts_manager: hosts文件管理器
+            firewall_manager: 防火墙管理器
             rule_ids: 规则ID列表
             operation_type: 操作类型 ('enable', 'disable', 'delete')
         """
         super().__init__()
         self.rule_manager = rule_manager
         self.hosts_manager = hosts_manager
+        self.firewall_manager = firewall_manager
         self.rule_ids = rule_ids
         self.operation_type = operation_type
         self.success_count = 0
@@ -272,13 +344,19 @@ class BatchOperationWorker(QThread):
                     # 跳过用户添加的规则，我们将从数据库重新添加
                     continue
             
-            # 添加启用的规则
+            # 添加启用的规则（IPv4 + IPv6）
             for rule in enabled_rules:
                 new_lines.append(f"{rule['redirect_to']} {rule['domain']}")
+                ipv6 = '0.0.0.0' if rule['redirect_to'] == '0.0.0.0' else '::1'
+                new_lines.append(f"{ipv6} {rule['domain']}")
             
             # 写入新的 hosts 文件
             new_content = '\n'.join(new_lines)
             self.hosts_manager.write_hosts(new_content)
+            
+            # 同步防火墙规则
+            enabled_domains = [r['domain'] for r in enabled_rules]
+            self.firewall_manager.sync_firewall_rules(enabled_domains)
             
         except Exception as e:
             raise Exception(f"同步 hosts 文件失败: {str(e)}")
@@ -293,6 +371,8 @@ class MainWindow(QMainWindow):
         # 初始化管理器
         self.hosts_manager = HostsManager()
         self.rule_manager = RuleManager()
+        self.firewall_manager = FirewallManager()
+        self.doh_controller = DohController()
         self.logger = get_logger("DEBUG")
         
         # 当前显示的规则
@@ -307,14 +387,25 @@ class MainWindow(QMainWindow):
         self.init_ui()
         self.apply_styles()
         
+        # 启动时自动禁用浏览器 DoH（确保 hosts 屏蔽生效）
+        self._ensure_doh_disabled()
+        
+        # 启动时迁移：将数据库中 127.0.0.1 的规则改为 0.0.0.0
+        # （修复本地代理服务监听 80/443 导致 127.0.0.1 被代理转发绕过的问题）
+        QTimer.singleShot(200, self._migrate_redirect_ip)
+        
         # 加载数据
-        QTimer.singleShot(100, self.load_rules)
+        QTimer.singleShot(500, self.load_rules)
+        
+        # 启动时同步防火墙规则（确保与数据库一致）
+        QTimer.singleShot(1500, self._startup_sync_firewall)
     
     def init_ui(self):
         """初始化用户界面"""
         # 设置窗口属性
         self.setWindowTitle("SafeRoot")
-        self.resize(900, 600)
+        self.setWindowIcon(self._load_icon())
+        self.resize(900, 700)
         
         # 创建中央部件
         central_widget = QWidget()
@@ -322,6 +413,11 @@ class MainWindow(QMainWindow):
         
         # 主布局
         main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        
+        # 用 QSplitter 分割上方标签页和下方日志面板
+        self.splitter = QSplitter(Qt.Vertical)
         
         # 创建标签页
         self.tab_widget = QTabWidget()
@@ -335,12 +431,111 @@ class MainWindow(QMainWindow):
         self.tab_widget.addTab(self.tab_backup, "备份管理")
         self.tab_widget.addTab(self.tab_settings, "系统设置")
         
-        main_layout.addWidget(self.tab_widget)
+        self.splitter.addWidget(self.tab_widget)
+        
+        # === 日志面板 ===
+        log_container = QWidget()
+        log_layout = QVBoxLayout(log_container)
+        log_layout.setContentsMargins(5, 2, 5, 2)
+        
+        log_header = QHBoxLayout()
+        log_label = QLabel("运行日志")
+        log_label.setStyleSheet("font-weight: bold; color: #333;")
+        btn_clear_log = QPushButton("清空")
+        btn_clear_log.setFixedWidth(50)
+        btn_clear_log.setStyleSheet("background-color: #6c757d; padding: 2px 8px; font-size: 12px;")
+        btn_clear_log.clicked.connect(self._clear_log)
+        log_header.addWidget(log_label)
+        log_header.addStretch()
+        log_header.addWidget(btn_clear_log)
+        log_layout.addLayout(log_header)
+        
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMaximumHeight(150)
+        self.log_text.setStyleSheet("""
+            QTextEdit {
+                background-color: #1e1e1e;
+                color: #d4d4d4;
+                font-family: "Consolas", "Microsoft YaHei";
+                font-size: 12px;
+                border: 1px solid #555;
+                border-radius: 3px;
+            }
+        """)
+        log_layout.addWidget(self.log_text)
+        
+        self.splitter.addWidget(log_container)
+        self.splitter.setStretchFactor(0, 4)
+        self.splitter.setStretchFactor(1, 1)
+        
+        main_layout.addWidget(self.splitter)
         
         # 创建状态栏
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("就绪")
+        
+        # 将日志记录器桥接到 UI
+        self._setup_log_bridge()
+    
+    def _setup_log_bridge(self):
+        """将 Python logging 桥接到日志面板"""
+        try:
+            import logging
+            
+            class QtLogHandler(logging.Handler):
+                """将日志消息发送到 QTextEdit"""
+                def __init__(self, text_edit):
+                    super().__init__()
+                    self.text_edit = text_edit
+                
+                def emit(self, record):
+                    msg = self.format(record)
+                    # 按日志级别着色
+                    if record.levelno >= logging.ERROR:
+                        color = "#f44747"
+                    elif record.levelno >= logging.WARNING:
+                        color = "#cca700"
+                    elif record.levelno >= logging.INFO:
+                        color = "#d4d4d4"
+                    else:
+                        color = "#808080"
+                    html = f'<span style="color:{color}">[{self.format_time(record)}] {msg}</span>'
+                    self.text_edit.append(html)
+                
+                @staticmethod
+                def format_time(record):
+                    return record.asctime.split(' ')[1] if hasattr(record, 'asctime') else ""
+            
+            handler = QtLogHandler(self.log_text)
+            handler.setFormatter(logging.Formatter('%(levelname)s - %(message)s', datefmt='%H:%M:%S'))
+            
+            # 获取 SafeRoot 的 logger 并添加 handler
+            logger = logging.getLogger('SafeRoot')
+            logger.addHandler(handler)
+            logger.setLevel(logging.DEBUG)
+            
+            self._log_handler = handler
+            
+        except Exception:
+            pass
+    
+    def _load_icon(self):
+        """加载应用程序图标"""
+        icon_path = os.path.join(APP_ROOT, 'SafeRoot.ico') if 'APP_ROOT' in dir() else 'SafeRoot.ico'
+        if os.path.exists(icon_path):
+            return QIcon(icon_path)
+        # 兼容 PyInstaller 打包后
+        if getattr(sys, 'frozen', False):
+            icon_path = os.path.join(os.path.dirname(sys.executable), 'SafeRoot.ico')
+            if os.path.exists(icon_path):
+                return QIcon(icon_path)
+        return QIcon()
+
+    def _clear_log(self):
+        """清空日志面板"""
+        self.log_text.clear()
     
     def create_shield_tab(self) -> QWidget:
         """创建屏蔽列表标签页"""
@@ -451,15 +646,89 @@ class MainWindow(QMainWindow):
     
     def create_settings_tab(self) -> QWidget:
         """创建系统设置标签页"""
+        # 外层容器
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+
         # 创建SettingsTab实例
         self.settings_tab = SettingsTab(self.hosts_manager, self.rule_manager, self)
-        
+        container_layout.addWidget(self.settings_tab)
+
         # 连接信号到槽函数
         self.settings_tab.settings_changed.connect(self.on_settings_changed)
         self.settings_tab.auto_start_changed.connect(self.on_auto_start_changed)
         self.settings_tab.notification_changed.connect(self.on_notification_changed)
-        
-        return self.settings_tab
+
+        # === DoH 控制面板 ===
+        doh_group = QGroupBox("浏览器安全 DNS (DoH) 控制")
+        doh_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                font-size: 14px;
+                border: 2px solid #2D5F9E;
+                border-radius: 8px;
+                margin-top: 12px;
+                padding-top: 16px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 16px;
+                padding: 0 8px;
+                color: #2D5F9E;
+            }
+        """)
+        doh_layout = QVBoxLayout(doh_group)
+
+        desc = QLabel(
+            '浏览器启用"安全 DNS"后会绕过系统 hosts 文件，导致屏蔽规则失效。\n'
+            'SafeRoot 需要关闭浏览器的安全 DNS 才能确保屏蔽生效。'
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: #666; font-size: 12px; margin-bottom: 8px;")
+        doh_layout.addWidget(desc)
+
+        # 各浏览器状态
+        self._doh_status_labels = {}
+        for browser_name in ['Google Chrome', 'Microsoft Edge', 'Mozilla Firefox']:
+            row = QHBoxLayout()
+            name_label = QLabel(browser_name)
+            name_label.setFixedWidth(130)
+            name_label.setStyleSheet("font-size: 13px;")
+            status_label = QLabel("检测中...")
+            status_label.setStyleSheet("color: #999;")
+            row.addWidget(name_label)
+            row.addWidget(status_label)
+            row.addStretch()
+            doh_layout.addLayout(row)
+            self._doh_status_labels[browser_name] = status_label
+
+        # 操作按钮
+        btn_row = QHBoxLayout()
+        self.btn_toggle_doh = QPushButton("关闭所有浏览器的安全 DNS")
+        self.btn_toggle_doh.setStyleSheet("""
+            QPushButton {
+                background-color: #e74c3c;
+                color: white;
+                border: none;
+                padding: 8px 20px;
+                border-radius: 4px;
+                font-weight: bold;
+                font-size: 13px;
+            }
+            QPushButton:hover { background-color: #c0392b; }
+        """)
+        self.btn_toggle_doh.clicked.connect(self.on_doh_toggle)
+        btn_row.addWidget(self.btn_toggle_doh)
+        btn_row.addStretch()
+        doh_layout.addLayout(btn_row)
+
+        container_layout.addWidget(doh_group)
+
+        # 延迟刷新 DoH 状态
+        QTimer.singleShot(500, self._refresh_doh_panel)
+
+        return container
     
     def apply_styles(self):
         """应用样式表"""
@@ -718,10 +987,14 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "操作进行中", "当前有操作正在进行，请稍候")
                 return
             
+            # 保存待验证的规则数据
+            self._pending_rules_data = rules_data
+
             # 创建后台工作线程
             worker = AddRuleWorker(
                 self.rule_manager,
                 self.hosts_manager,
+                self.firewall_manager,
                 rules_data,
                 is_batch
             )
@@ -761,6 +1034,20 @@ class MainWindow(QMainWindow):
                 self.status_bar.showMessage(
                     f"批量添加完成: {success_count} 条成功, {len(failed_domains)} 条失败", 5000
                 )
+
+            # 启动 DNS 验证
+            verified_domains = []
+            for rd in self._pending_rules_data:
+                domain = rd['domain']
+                if domain not in [fd.split(' (')[0] for fd in failed_domains]:
+                    verified_domains.append(domain)
+            if verified_domains:
+                self.logger.info(f"正在验证 {len(verified_domains)} 个域名的屏蔽状态...")
+                self.status_bar.showMessage("正在验证屏蔽效果...")
+                self._verify_worker = VerifyWorker(verified_domains)
+                self._verify_worker.result.connect(self._on_verify_result)
+                self._verify_worker.finished.connect(self._verify_worker.deleteLater)
+                self._verify_worker.start()
         else:
             self.logger.warning("没有规则添加成功")
         
@@ -781,6 +1068,14 @@ class MainWindow(QMainWindow):
             self.current_worker = None
             self.operation_in_progress = False
             worker.deleteLater()
+
+    def _on_verify_result(self, domain: str, info: str, is_blocked: bool, method: str):
+        """验证结果回调"""
+        if is_blocked:
+            self.logger.info(f"[验证通过] {domain} | {info} (方法: {method})")
+        else:
+            self.logger.warning(f"[验证失败] {domain} | {info} (请关闭浏览器后重试)")
+        self.status_bar.showMessage(f"验证完成: {domain} {'已屏蔽' if is_blocked else '未屏蔽'}", 5000)
 
     def _on_add_rule_error(self, error_message: str):
         """添加规则错误回调（主线程执行）"""
@@ -815,6 +1110,8 @@ class MainWindow(QMainWindow):
             if success:
                 # 从 hosts 文件删除
                 self.hosts_manager.remove_rule(rule['domain'])
+                # 移除防火墙阻断规则
+                self.firewall_manager.unblock_domain(rule['domain'])
             
             return success
             
@@ -864,12 +1161,22 @@ class MainWindow(QMainWindow):
                         rule['domain'],
                         rule['redirect_to']
                     )
+                    # 确保防火墙阻断规则存在
+                    try:
+                        self.firewall_manager.block_domain(rule['domain'])
+                    except Exception as e:
+                        self.logger.warning(f"启用规则时同步防火墙失败: {e}")
                     return hosts_success
             else:
                 db_success = self.rule_manager.disable_rule(rule_id)
                 if db_success:
                     # 从 hosts 文件禁用
                     hosts_success = self.hosts_manager.disable_rule(rule['domain'])
+                    # 移除防火墙阻断规则
+                    try:
+                        self.firewall_manager.unblock_domain(rule['domain'])
+                    except Exception as e:
+                        self.logger.warning(f"禁用规则时移除防火墙失败: {e}")
                     return hosts_success
             
             return False
@@ -957,6 +1264,7 @@ class MainWindow(QMainWindow):
             worker = BatchOperationWorker(
                 self.rule_manager,
                 self.hosts_manager,
+                self.firewall_manager,
                 list(self.selected_rules),
                 'delete'
             )
@@ -995,6 +1303,7 @@ class MainWindow(QMainWindow):
         worker = BatchOperationWorker(
             self.rule_manager,
             self.hosts_manager,
+            self.firewall_manager,
             list(self.selected_rules),
             'enable'
         )
@@ -1106,6 +1415,7 @@ class MainWindow(QMainWindow):
         worker = BatchOperationWorker(
             self.rule_manager,
             self.hosts_manager,
+            self.firewall_manager,
             list(self.selected_rules),
             'disable'
         )
@@ -1221,6 +1531,10 @@ class MainWindow(QMainWindow):
                 new_content = '\n'.join(keep_lines)
                 self.hosts_manager.write_hosts(new_content)
                 
+                # 清理所有防火墙规则
+                cleaned = self.firewall_manager.cleanup_all()
+                self.logger.info(f"已清理 {cleaned} 条防火墙规则")
+                
                 # 重新加载规则
                 self.load_rules()
                 
@@ -1232,7 +1546,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "操作失败", f"全部恢复失败: {str(e)}")
     
     def sync_hosts_with_db(self):
-        """同步 hosts 文件与数据库"""
+        """同步 hosts 文件与数据库，同时同步防火墙规则"""
         try:
             # 读取当前 hosts 文件
             current_content = self.hosts_manager.read_hosts()
@@ -1257,13 +1571,19 @@ class MainWindow(QMainWindow):
                     # 跳过用户添加的规则，我们将从数据库重新添加
                     continue
             
-            # 添加启用的规则
+            # 添加启用的规则（IPv4 + IPv6）
             for rule in enabled_rules:
                 new_lines.append(f"{rule['redirect_to']} {rule['domain']}")
+                ipv6 = '0.0.0.0' if rule['redirect_to'] == '0.0.0.0' else '::1'
+                new_lines.append(f"{ipv6} {rule['domain']}")
             
             # 写入新的 hosts 文件
             new_content = '\n'.join(new_lines)
             self.hosts_manager.write_hosts(new_content)
+            
+            # 同步防火墙规则
+            enabled_domains = [r['domain'] for r in enabled_rules]
+            self.firewall_manager.sync_firewall_rules(enabled_domains)
             
         except Exception as e:
             raise Exception(f"同步 hosts 文件失败: {str(e)}")
@@ -1293,6 +1613,11 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage("hosts文件已重置为系统默认", 3000)
         # 清空数据库中的所有规则
         self.rule_manager.clear_all_rules()
+        # 清理所有防火墙规则
+        try:
+            self.firewall_manager.cleanup_all()
+        except Exception as e:
+            self.logger.warning(f"重置 hosts 时清理防火墙规则失败: {e}")
         # 刷新规则列表
         self.load_rules()
     
@@ -1396,6 +1721,103 @@ class MainWindow(QMainWindow):
         except Exception as e:
             raise Exception(f"更新数据库失败: {str(e)}")
     
+    # === DoH 控制 ===
+
+    def _migrate_redirect_ip(self):
+        """启动时将数据库中 redirect_to=127.0.0.1 的规则迁移为 0.0.0.0
+        
+        原因：127.0.0.1 上经常有本地代理/加速器服务监听 80/443 端口，
+        浏览器连上后会通过代理转发到真实服务器，导致屏蔽被完全绕过。
+        0.0.0.0 是一个不可路由地址，连接会直接失败，屏蔽更可靠。
+        """
+        try:
+            rules = self.rule_manager.get_all_rules()
+            migrated = 0
+            for rule in rules:
+                if rule.get('redirect_to') == '127.0.0.1':
+                    self.rule_manager.update_rule(
+                        rule['id'],
+                        redirect_to='0.0.0.0'
+                    )
+                    migrated += 1
+            if migrated > 0:
+                self.logger.info(f"已迁移 {migrated} 条规则的重定向地址: 127.0.0.1 -> 0.0.0.0")
+                # 同步 hosts 文件中的已有条目
+                self.sync_hosts_with_db()
+        except Exception as e:
+            self.logger.warning(f"迁移重定向地址失败: {e}")
+
+    def _startup_sync_firewall(self):
+        """启动时同步防火墙规则，确保与数据库中的启用规则一致"""
+        try:
+            enabled_rules = self.rule_manager.get_all_rules(enabled_only=True)
+            enabled_domains = [r['domain'] for r in enabled_rules]
+            if enabled_domains:
+                self.firewall_manager.sync_firewall_rules(enabled_domains)
+                self.logger.info(f"启动时同步了 {len(enabled_domains)} 条防火墙规则")
+        except Exception as e:
+            self.logger.warning(f"启动时同步防火墙规则失败: {e}")
+
+    def _ensure_doh_disabled(self):
+        """启动时确保浏览器 DoH 已禁用"""
+        try:
+            enabled, browser, state = self.doh_controller.is_any_browser_doh_enabled()
+            if enabled:
+                results = self.doh_controller.disable_all()
+                disabled_count = sum(1 for v in results.values() if v)
+                self.logger.info(f"已关闭 {disabled_count} 个浏览器的安全 DNS (DoH)，确保 hosts 屏蔽生效")
+            else:
+                self.logger.info("浏览器安全 DNS (DoH) 已处于关闭状态")
+        except Exception as e:
+            self.logger.warning(f"检查 DoH 状态失败: {e}")
+
+    def on_doh_toggle(self):
+        """切换 DoH 开关"""
+        status = self.doh_controller.get_status()
+        any_disabled = any(v == 'disabled' for v in status.values())
+
+        if any_disabled:
+            reply = QMessageBox.question(
+                self, "恢复浏览器 DNS 设置",
+                "即将恢复所有浏览器的默认 DNS 设置。\n"
+                "恢复后，hosts 屏蔽可能对启用了安全 DNS 的浏览器无效。\n\n"
+                "确定要恢复吗？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if reply == QMessageBox.Yes:
+                self.doh_controller.restore_all()
+                self.logger.info("已恢复所有浏览器的 DNS 设置")
+                self._refresh_doh_panel()
+                QMessageBox.information(self, "已恢复",
+                    "已恢复所有浏览器的默认 DNS 设置。\n请重启浏览器使设置生效。")
+        else:
+            results = self.doh_controller.disable_all()
+            disabled_count = sum(1 for v in results.values() if v)
+            self.logger.info(f"已关闭 {disabled_count} 个浏览器的安全 DNS (DoH)")
+            self._refresh_doh_panel()
+            QMessageBox.information(self, "已关闭",
+                f"已关闭 {disabled_count} 个浏览器的安全 DNS。\n请关闭并重新打开浏览器使设置生效。")
+
+    def _refresh_doh_panel(self):
+        """刷新 DoH 状态面板"""
+        if not hasattr(self, '_doh_status_labels'):
+            return
+        status = self.doh_controller.get_status()
+        for browser, label in self._doh_status_labels.items():
+            state = status.get(browser, 'unknown')
+            if state == 'disabled':
+                label.setText("已关闭")
+                label.setStyleSheet("color: #27ae60; font-weight: bold;")
+            elif state == 'enabled':
+                label.setText("已开启")
+                label.setStyleSheet("color: #e74c3c; font-weight: bold;")
+            elif state == 'default':
+                label.setText("默认")
+                label.setStyleSheet("color: #f39c12; font-weight: bold;")
+            else:
+                label.setText("未检测")
+                label.setStyleSheet("color: #999;")
+
     # === 系统设置页功能 ===
     
     def on_settings_changed(self, config: dict):
@@ -1442,7 +1864,7 @@ class MainWindow(QMainWindow):
                     self.cb_auto_backup.setChecked(True)
                     self.spin_keep_backups.setValue(10)
                     self.cb_check_update.setChecked(True)
-                    self.edit_default_ip.setText("127.0.0.1")
+                    self.edit_default_ip.setText("0.0.0.0")
                     self.combo_log_level.setCurrentText("INFO")
                     
                     QMessageBox.information(self, "恢复成功", "设置已恢复为默认值")

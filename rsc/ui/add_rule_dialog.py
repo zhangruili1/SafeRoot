@@ -282,7 +282,7 @@ class AddRuleDialog(QDialog):
         advanced_layout = QFormLayout()
         
         self.ip_input = QLineEdit()
-        self.ip_input.setText("127.0.0.1")
+        self.ip_input.setText("0.0.0.0")
         self.ip_input.setPlaceholderText("指向的IP地址")
         advanced_layout.addRow("指向IP:", self.ip_input)
         
