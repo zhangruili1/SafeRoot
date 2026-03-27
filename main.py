@@ -9,13 +9,24 @@ import os
 import ctypes
 import traceback
 
+# PyInstaller 打包后，sys.executable 指向临时解压目录，
+# 需要将 EXE 所在目录（即项目根目录）加入 sys.path，
+# 以便正确导入 constants.py 等非标准库模块。
+def get_app_root():
+    """获取应用程序根目录（兼容 PyInstaller 打包和普通运行）"""
+    if getattr(sys, 'frozen', False):
+        # PyInstaller 打包后：EXE 所在目录
+        return os.path.dirname(sys.executable)
+    else:
+        # 普通运行：脚本所在目录
+        return os.path.dirname(os.path.abspath(__file__))
+
+APP_ROOT = get_app_root()
+if APP_ROOT not in sys.path:
+    sys.path.insert(0, APP_ROOT)
+
 # 导入常量
-try:
-    from constants import APP_NAME, APP_VERSION, create_directories
-except ImportError:
-    # 如果直接运行，尝试从当前目录导入
-    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-    from constants import APP_NAME, APP_VERSION, create_directories
+from constants import APP_NAME, APP_VERSION, create_directories
 
 
 def is_admin():
@@ -29,8 +40,10 @@ def is_admin():
 def request_admin_restart():
     """请求管理员权限重新启动应用程序"""
     try:
+        # 使用 EXE/脚本的实际路径重启，而非 sys.executable（打包后指向临时目录）
+        app_path = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
         ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", sys.executable, " ".join(sys.argv), None, 1
+            None, "runas", app_path, " ".join(sys.argv), None, 1
         )
         return True
     except Exception as e:
@@ -75,10 +88,17 @@ def main():
     app.setApplicationVersion(APP_VERSION)
     
     # 设置全局异常处理
+    import logging
+    _crash_logger = logging.getLogger('crash')
+    _crash_handler = logging.FileHandler(os.path.join(APP_ROOT, 'crash.log'), encoding='utf-8')
+    _crash_handler.setFormatter(logging.Formatter('%(asctime)s\n%(message)s'))
+    _crash_logger.addHandler(_crash_handler)
+
     def exception_handler(exc_type, exc_value, exc_traceback):
         """全局异常处理器"""
         error_msg = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
         print(f"未捕获的异常:\n{error_msg}")
+        _crash_logger.error(error_msg)
         
         # 在GUI中显示错误
         try:
